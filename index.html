@@ -1,0 +1,150 @@
+<!-- ============================================================================
+     FILE: webapp-actor/index.html
+     Página estática del INVITADO (actor/traductor/cliente/etc.). Hospedar
+     en cualquier servicio con HTTPS (Vercel, Netlify, Cloudflare Pages...).
+     ============================================================================ -->
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sala de Grabación Remota</title>
+  <style>
+    * { box-sizing: border-box; font-family: sans-serif; }
+    body { margin:0; background:#111; color:#eee; height:100vh; display:flex; flex-direction:column; }
+    video { width:100%; max-height:60vh; object-fit:cover; background:#000; }
+    .bar { padding:12px; text-align:center; }
+    button { padding:9px 16px; font-size:0.95em; border-radius:6px; border:none; background:#2a7; color:#fff; margin:4px; cursor:pointer; }
+    button:disabled { opacity:0.4; cursor:not-allowed; }
+    select, input[type=text] { padding:8px; border-radius:6px; border:1px solid #444; background:#1a1a1a; color:#eee; width:80%; max-width:300px; }
+    #camRequestBanner { display:none; background:#4a3f1f; color:#ffd080; padding:10px; text-align:center; }
+    #localPreview { max-height:100px; position:fixed; bottom:60px; right:10px; width:140px; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <div id="camRequestBanner">
+    🎥 El director solicita que actives tu cámara.
+    <button id="btnAcceptCam">Aceptar</button>
+    <button id="btnDeclineCam" style="background:#6a1f1f;">Rechazar</button>
+  </div>
+
+  <video id="remoteVideo" autoplay playsinline></video>
+
+  <div class="bar" id="joinForm">
+    <p id="status">Identifícate para solicitar unirte:</p>
+    <select id="roleSelect">
+      <option value="Actor">Actor</option>
+      <option value="Actriz">Actriz</option>
+      <option value="Director invitado">Director invitado</option>
+      <option value="Traductor">Traductor</option>
+      <option value="Cliente">Cliente</option>
+      <option value="Otro">Otro (especificar)</option>
+    </select><br/><br/>
+    <input id="nameInput" type="text" placeholder="Tu nombre" /><br/><br/>
+    <button id="btnJoin">Solicitar unirme</button>
+  </div>
+
+  <div class="bar">
+    <button id="btnToggleCam" style="display:none;">🎥 Activar mi cámara</button>
+  </div>
+
+  <video id="localPreview" autoplay playsinline muted style="display:none;"></video>
+
+  <script>
+    const SIGNALING_URL = "wss://TU-SERVIDOR.ejemplo.com/ws"; // debe coincidir con el host
+    const RTC_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+    const sid = new URLSearchParams(location.search).get("s");
+
+    const statusEl = document.getElementById("status");
+    const remoteVideo = document.getElementById("remoteVideo");
+    const localPreview = document.getElementById("localPreview");
+    const btnJoin = document.getElementById("btnJoin");
+    const btnToggleCam = document.getElementById("btnToggleCam");
+    const banner = document.getElementById("camRequestBanner");
+
+    let pc = null, ws = null, localStream = null, camStream = null;
+
+    if (!sid) { statusEl.textContent = "Enlace inválido."; btnJoin.disabled = true; }
+
+    btnJoin.addEventListener("click", async () => {
+      const role = document.getElementById("roleSelect").value;
+      const customName = document.getElementById("nameInput").value.trim();
+      const label = customName ? `${role} - ${customName}` : role;
+
+      // Por defecto solo audio (micrófono). La cámara es opt-in posterior.
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+
+      ws = new WebSocket(SIGNALING_URL);
+      ws.onopen = () => ws.send(JSON.stringify({ type: "join-request", session: sid, label }));
+      ws.onmessage = (ev) => handleMessage(JSON.parse(ev.data));
+      ws.onerror = () => { statusEl.textContent = "Error de conexión con el servidor."; };
+
+      btnJoin.disabled = true;
+      statusEl.textContent = "Solicitud enviada. Esperando aprobación del director...";
+    });
+
+    function handleMessage(msg) {
+      if (msg.type === "waiting") { statusEl.textContent = "En sala de espera..."; }
+      else if (msg.type === "rejected") { statusEl.textContent = "El director rechazó tu solicitud."; }
+      else if (msg.type === "room-full") { statusEl.textContent = "La sala está llena (máx. 10 participantes)."; }
+      else if (msg.type === "room-closed") { statusEl.textContent = "La sesión fue finalizada."; cleanup(); }
+      else if (msg.type === "kicked") { statusEl.textContent = "Fuiste removido de la sesión."; cleanup(); }
+      else if (msg.type === "admitted") { onAdmitted(); }
+      else if (msg.type === "signal") { onSignal(msg.data); }
+      else if (msg.type === "request-camera") { banner.style.display = "block"; }
+    }
+
+    async function onAdmitted() {
+      statusEl.textContent = "Conectado con el estudio.";
+      document.getElementById("joinForm").style.display = "none";
+      btnToggleCam.style.display = "inline-block";
+
+      pc = new RTCPeerConnection(RTC_CONFIG);
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+      pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: "signal", session: sid, data: { candidate: e.candidate } })); };
+      pc.ontrack = (e) => { remoteVideo.srcObject = e.streams[0]; };
+      // El host inicia la oferta tras admitir; este cliente solo espera y responde.
+    }
+
+    async function onSignal(data) {
+      if (data.sdp) {
+        if (data.sdp.type === "offer") {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          ws.send(JSON.stringify({ type: "signal", session: sid, data: { sdp: pc.localDescription } }));
+        } else if (data.sdp.type === "answer") {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+        }
+      } else if (data.candidate) {
+        try { await pc.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch {}
+      }
+    }
+
+    async function activateCamera() {
+      camStream = await navigator.mediaDevices.getUserMedia({ video: true });
+      const track = camStream.getVideoTracks()[0];
+      pc.addTrack(track, camStream);
+      localPreview.srcObject = camStream;
+      localPreview.style.display = "block";
+      // Renegociación iniciada por el invitado (el host la maneja como "offer" entrante)
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      ws.send(JSON.stringify({ type: "signal", session: sid, data: { sdp: pc.localDescription } }));
+      btnToggleCam.textContent = "🎥 Cámara activa";
+      btnToggleCam.disabled = true;
+    }
+
+    btnToggleCam.addEventListener("click", activateCamera);
+    document.getElementById("btnAcceptCam").addEventListener("click", () => { banner.style.display = "none"; activateCamera(); });
+    document.getElementById("btnDeclineCam").addEventListener("click", () => { banner.style.display = "none"; });
+
+    function cleanup() {
+      if (pc) pc.close();
+      if (localStream) localStream.getTracks().forEach(t => t.stop());
+      if (camStream) camStream.getTracks().forEach(t => t.stop());
+    }
+  </script>
+</body>
+</html>
